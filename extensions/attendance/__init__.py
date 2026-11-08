@@ -50,13 +50,27 @@ def to_military_times(time_range) -> tuple[tuple[int, int], tuple[int, int]]:
     return parse_time(start, start_period), parse_time(end, end_period)
 
 class ExtensionCog(commands.Cog):
-    extension_commands = app_commands.Group(name="attendance", description="Commands related to attendance.")
+    extension_commands = app_commands.Group(name="attendance", description="Commands related to attendance.", guild_only=True)
 
     async def schedule_message(self, dt: datetime, message: str, channel: discord.TextChannel):
         delay = (dt - datetime.now(dt_timezone.utc)).total_seconds()
         if delay > 0:
             await asyncio.sleep(delay)
-            await channel.send(message)
+        chunks = []
+        while len(message) > 2000:
+            split_at = message.rfind("\n", 0, 2000)
+            if split_at <= 0:
+                split_at = 2000
+            chunks.append(message[:split_at])
+            message = message[split_at:].lstrip("\n")
+        if message:
+            chunks.append(message)
+        for chunk in chunks:
+            try:
+                await channel.send(chunk)
+            except discord.DiscordException as e:
+                print(f"Failed to send attendance reminder: {e}")
+                break
 
     def __init__(self, bot: commands.Bot):
         self.reminders = {}
@@ -64,43 +78,203 @@ class ExtensionCog(commands.Cog):
         self.update_all_sheets_attendance.start()
 
     async def schedule_reminders(self):
+        desired = {}
+        unavailable_servers = set()
+        now = datetime.now(dt_timezone.utc)
+        sheet_configs = {}
         for reminder_time in await db.get_reminder_times():
             server_id = reminder_time["server_id"]
             server = await db.get_server(server_id)
-            channel = await self.bot.fetch_channel(server["reminder_channel_id"])
-            events = await db.get_events(server_id)
-            for event in events:
+            if server is None:
+                continue
+            try:
+                channel = self.bot.get_channel(server["reminder_channel_id"]) or await self.bot.fetch_channel(server["reminder_channel_id"])
+            except discord.HTTPException as e:
+                print(f"Unable to fetch reminder channel for server {server_id}: {e}")
+                unavailable_servers.add(server_id)
+                continue
+            if server_id not in sheet_configs:
+                sheet_configs[server_id] = await db.get_sheet_config(server_id) or {}
+            for event in await db.get_events(server_id):
                 attendees = await db.get_attendees(server_id, event["event_id"])
-                pings = ""
-                for attendee in attendees:
-                    if attendee["status"] in {"Y", "M"}:
-                        pings += f"<@{attendee['discord_id']}> " if attendee["discord_id"] else f"{attendee['name']} "
-                pings = f"||{pings}||"
+
+                def roster(status, ping=True):
+                    names = [
+                        f"{a['name']} ||<@{a['discord_id']}>||" if ping and a["discord_id"] else a["name"]
+                        for a in attendees if a["status"] == status
+                    ]
+                    return "\n".join(f"> {name}" for name in names) if names else "None"
+
+                pings = " ".join(
+                    f"<@{a['discord_id']}>" if a["discord_id"] else a["name"]
+                    for a in attendees if a["status"] in {"Y", "M"}
+                )
                 start_time = event["start_time"]
-                if start_time - reminder_time["minutes"] * 60 <= datetime.now(dt_timezone.utc).timestamp():
+                minutes = reminder_time["minutes"]
+                due = datetime.fromtimestamp(start_time - minutes * 60, tz=dt_timezone.utc)
+                key = (server_id, str(event["event_id"]), str(minutes))
+                try:
+                    local_start = datetime.fromtimestamp(start_time, tz=dt_timezone.utc).astimezone(ZoneInfo(server["timezone"]))
+                    message = server["message"].format(
+                        users=f"||{pings}||" if pings else "None",
+                        meeting=event["name"],
+                        attendees=roster("Y"),
+                        maybe=roster("M"),
+                        potential=roster("M"),
+                        not_attending=roster("N", ping=False),
+                        unknown=roster(""),
+                        date=local_start.strftime("%B %-d, %Y"),
+                        time=local_start.strftime("%-I:%M %p"),
+                        end_time=(datetime.fromtimestamp(event["end_time"], tz=dt_timezone.utc)
+                                  .astimezone(ZoneInfo(server["timezone"])).strftime("%-I:%M %p")
+                                  if event["end_time"] else "unavailable"),
+                        spreadsheet=sheet_configs[server_id].get("url", ""),
+                    )
+                except (KeyError, IndexError, ValueError) as e:
+                    print(f"Invalid reminder template for server {server_id}: {e}")
                     continue
-                self.reminders.setdefault(str(event['event_id']), {})[
-                    str(reminder_time["minutes"])
-                ] = asyncio.create_task(self.schedule_message(
-                    datetime.fromtimestamp(start_time - timedelta(minutes=reminder_time["minutes"]).total_seconds(), tz=dt_timezone.utc),
-                    server["message"].format(
-                        users=pings,
-                        meeting=event["name"]
-                    ), 
-                    channel
-                ))
+                signature = (due.timestamp(), message, channel.id)
+                old = self.reminders.get(key)
+                if due > now or (old and not old[1].done()):
+                    desired[key] = (signature, due, message, channel)
+
+        for key, (signature, task) in list(self.reminders.items()):
+            if key[0] in unavailable_servers:
+                continue
+            if key not in desired or signature != desired[key][0]:
+                task.cancel()
+                del self.reminders[key]
+
+        for key, (signature, due, message, channel) in desired.items():
+            old = self.reminders.get(key)
+            if old and not old[1].done() and old[0] == signature:
+                continue
+            if old:
+                old[1].cancel()
+            self.reminders[key] = (
+                signature,
+                asyncio.create_task(self.schedule_message(due, message, channel)),
+            )
+
+    @extension_commands.command(name="edit", description="edit one attendance bot setting")
+    @app_commands.describe(field="Setting to change", value="New value for that setting")
+    @app_commands.choices(field=[
+        app_commands.Choice(name="reminder channel ID", value="channel_id"),
+        app_commands.Choice(name="message template", value="message"),
+        app_commands.Choice(name="timezone", value="timezone"),
+        app_commands.Choice(name="spreadsheet URL", value="sheet_url"),
+        app_commands.Choice(name="worksheet name", value="sheet"),
+        app_commands.Choice(name="attendee rows", value="attendee_rows"),
+        app_commands.Choice(name="first event column", value="start_col"),
+        app_commands.Choice(name="date row", value="date_row"),
+        app_commands.Choice(name="time row", value="time_row"),
+        app_commands.Choice(name="attendee name column", value="user_col"),
+        app_commands.Choice(name="meeting name row", value="meeting_name_row"),
+        app_commands.Choice(name="last name column", value="user_col_last_name"),
+    ])
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def edit(self, interaction: discord.Interaction, field: app_commands.Choice[str], value: str):
+        server_id = interaction.guild.id
+        server_fields = {"channel_id": "reminder_channel_id", "message": "message", "timezone": "timezone"}
+        sheet_fields = {"sheet_url": "url", "sheet": "sheet", "attendee_rows": "attendee_rows", "start_col": "start_col", "date_row": "date_row", "time_row": "time_row", "user_col": "user_col", "meeting_name_row": "meeting_name_row", "user_col_last_name": "user_col_last_name"}
+        if field.value in server_fields:
+            if await db.get_server(server_id) is None:
+                await interaction.response.send_message(l.get("attendance.no_setup"), ephemeral=True)
+                return
+            if field.value == "timezone" and value not in available_timezones():
+                await interaction.response.send_message(l.get("attendance.unknown_timezone"), ephemeral=True)
+                return
+            if field.value == "channel_id":
+                try:
+                    parsed = int(value)
+                    if parsed <= 0:
+                        raise ValueError
+                except ValueError:
+                    await interaction.response.send_message("Channel ID must be a positive number.", ephemeral=True)
+                    return
+            elif field.value == "message":
+                try:
+                    value.format(**{name: "x" for name in ("users", "meeting", "attendees", "maybe", "potential", "not_attending", "unknown", "date", "time", "end_time", "spreadsheet")})
+                except (KeyError, IndexError, ValueError) as e:
+                    await interaction.response.send_message(f"Invalid message template: {e}", ephemeral=True)
+                    return
+                parsed = value
+            else:
+                parsed = value
+            await db.update_server_setting(server_id, server_fields[field.value], parsed)
+        else:
+            config = await db.get_sheet_config(server_id)
+            if config is None:
+                await interaction.response.send_message("Set up the spreadsheet before editing its settings.", ephemeral=True)
+                return
+            key = sheet_fields[field.value]
+            if key in {"meeting_name_row", "user_col_last_name"} and value.strip().lower() in {"none", "null", "clear"}:
+                parsed = None
+            elif key in {"date_row", "time_row", "meeting_name_row"}:
+                try:
+                    parsed = int(value)
+                    if parsed < 1:
+                        raise ValueError
+                except ValueError:
+                    await interaction.response.send_message("Row numbers must be positive integers (or 'none' for optional rows).", ephemeral=True)
+                    return
+            elif key == "attendee_rows":
+                match = re.fullmatch(r"\s*(\d+)\s*[:\-]\s*(\d+)\s*", value)
+                if not match or int(match[1]) < 1 or int(match[2]) < int(match[1]):
+                    await interaction.response.send_message("Attendee rows must be a range like 42:59.", ephemeral=True)
+                    return
+                parsed = value
+            elif key in {"start_col", "user_col", "user_col_last_name"}:
+                try:
+                    a1_to_rowcol(f"{value.upper()}1")
+                except Exception:
+                    await interaction.response.send_message("Column must be letters, like A or AB.", ephemeral=True)
+                    return
+                parsed = value.upper()
+            else:
+                parsed = value
+            config[key] = parsed
+            config.pop("server_id", None)
+            await db.save_gsheet_config(server_id, **config)
+        await interaction.response.send_message(f"Updated {field.name}.", ephemeral=True)
+
+    async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.MissingPermissions):
+            message = "You need Manage Server permission to use this command."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        else:
+            raise error
+
+    @extension_commands.command(name="help", description="show attendance bot command help")
+    @app_commands.guild_only()
+    async def help(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "**Attendance bot commands**\n"
+            "`/attendance setup` — choose the reminder channel, message template, timezone, and reminder times (default reminder: 3 hours before).\n"
+            "`/attendance setup_sheets` — connect an attendance spreadsheet.\n"
+            "`/attendance edit` — change one bot or spreadsheet setting.\n"
+            "`/attendance get_attendance` — view attendance for a meeting.\n"
+            "`/attendance link_discord` and `/attendance unlink_discord` — link attendee names to Discord members.\n\n"
+            "Message template fields: `{meeting}`, `{date}`, `{time}`, `{end_time}`, `{users}`, `{attendees}`, `{maybe}`, `{potential}`, `{not_attending}`, `{unknown}`, `{spreadsheet}`.",
+            ephemeral=True,
+        )
 
     @extension_commands.command(name="setup", description="quickly set up attendance tracking")
+    @app_commands.guild_only()
     @app_commands.describe(
         channel="The channel where attendance messages will be sent",
-        message="use {users} as a replacement for mentions and {meeting} as replacement for the time meeting",
-        time_before="time in minutes before to send reminder"
+        message="Template fields: {meeting}, {date}, {time}, {end_time}, {users}, {attendees}, {maybe}, {potential}, {not_attending}, {unknown}, {spreadsheet}.",
+        time_before="minutes before the meeting to send the reminder (default: 180, or 3 hours)"
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def setup(self, interaction: discord.Interaction,
         channel: discord.TextChannel,
-        message: str = "{users}\nHey, reminder that you are signed up for {meeting} today!",
-        time_before: app_commands.Range[int, 0, 1440] = 30,
+        message: str = "📣 **Meeting Name: {meeting}**\n📅 {date} · {time}–{end_time}\n\nAttendees (marked Y):\n{attendees}\n\nPotential (marked M):\n{potential}\n\nNot attending (marked N):\n{not_attending}\n\nUnknown (blank in spreadsheet):\n{unknown}\n\nIf you intend to come or change your status, please open the [spreadsheet here]({spreadsheet})",
+        time_before: app_commands.Range[int, 0, 1440] = 180,
         time_before_2: app_commands.Range[int, -1, 1440] = -1,
         timezone: str = "America/New_York"
     ):
@@ -158,9 +332,9 @@ class ExtensionCog(commands.Cog):
             raise e
 
         try:
-            spreadsheet = self.bot.gspread.open_by_url(url)
-            worksheet = spreadsheet.worksheet(sheet)
-            values = worksheet.get_all_values()
+            values = await asyncio.to_thread(
+                lambda: self.bot.gspread.open_by_url(url).worksheet(sheet).get_all_values()
+            )
         except Exception as e:
             raise e
 
@@ -176,14 +350,16 @@ class ExtensionCog(commands.Cog):
         attendance = []
 
         j = first_col
+        max_columns = max((len(row) for row in values), default=0)
         last_date = None
         prev_month = None
         running_year = now.year
         # iterate until the time row is empty to recognize all attendances since first_col
-        while True:
+        while j < max_columns:
             time_cell = cell(time_row - 1, j)
             if not time_cell:
-                break
+                j += 1
+                continue
             date_cell = cell(date_row - 1, j)
             if date_cell:
                 last_date = date_cell
@@ -204,24 +380,30 @@ class ExtensionCog(commands.Cog):
                 year = running_year
             prev_month = month
 
-            (start_hour, start_minute), (_, _) = to_military_times(time_cell)
+            (start_hour, start_minute), (end_hour, end_minute) = to_military_times(time_cell)
             local_start = datetime(year, month, day, start_hour, start_minute, tzinfo=tz)
+            local_end = datetime(year, month, day, end_hour, end_minute, tzinfo=tz)
+            if local_end <= local_start:
+                local_end += timedelta(days=1)
             start_utc = local_start.astimezone(dt_timezone.utc)
+            end_utc = local_end.astimezone(dt_timezone.utc)
 
             event_id = f"gs-{server_id}-{j}"
             meeting_name = cell(meeting_name_row - 1, j) if meeting_name_row else ""
             meeting_name = meeting_name or f"Event at {local_start.strftime('%B %d')}, {local_start.strftime('%I:%M %p')}"
-            events[event_id] = (meeting_name, start_utc)
+            events[event_id] = (meeting_name, start_utc, end_utc)
 
             for i in range(row_start, row_end):
                 attendee = cell(i, name_col)
                 if not attendee:
                     continue
                 if last_col is not None:
-                    attendee += f" {cell(i, last_col)[:1]}."
-                status = cell(i, j)[:1].upper() or "N"
-                if status not in {"Y", "M", "N"}:
-                    status = "N"
+                    last_name = cell(i, last_col)
+                    if last_name:
+                        attendee += f" {last_name[0]}."
+                status = cell(i, j)[:1].upper()
+                if status not in {"", "Y", "M", "N"}:
+                    status = ""
                 attendance.append((event_id, attendee, status))
             j += 1
 
@@ -233,6 +415,7 @@ class ExtensionCog(commands.Cog):
 
     
     @extension_commands.command(name="setup_sheets", description="set up googlel sheets attendance sheet")
+    @app_commands.guild_only()
     @app_commands.describe(
         url="link to the google sheet",
         attendee_rows="rows where the attendees are i.e. 42:58",
@@ -302,6 +485,7 @@ class ExtensionCog(commands.Cog):
         )
 
     @extension_commands.command(name="get_attendance", description="see who is signed up for each meeting")
+    @app_commands.guild_only()
     @app_commands.describe(name="the name of the meeting to look up")
     async def get_attendance(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer(ephemeral=True)
@@ -379,6 +563,7 @@ class ExtensionCog(commands.Cog):
         ]
     
     @extension_commands.command(name="unlink_discord")
+    @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.autocomplete(name=attendee_name_autocomplete)
     async def unlink_discord(self, interaction: discord.Interaction, name: int):
@@ -388,6 +573,7 @@ class ExtensionCog(commands.Cog):
             await interaction.response.send_message(l.get("attendance.unlink_discord_failed_message"))
 
     @extension_commands.command(name="link_discord")
+    @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.autocomplete(name=attendee_name_autocomplete)
     async def link_discord(self, interaction: discord.Interaction, name: int, member: discord.Member):
@@ -404,12 +590,9 @@ class ExtensionCog(commands.Cog):
                 if existing is None:
                     continue
                 await self.update_sheets_attendance(server.id)
-            except Exception:
+            except Exception as e:
+                print(f"Attendance sync failed for server {server.id}: {e}")
                 continue
-            for event_id in list(self.reminders):
-                for _, task in list(self.reminders[event_id].items()):
-                    task.cancel()
-                del self.reminders[event_id]
         await self.schedule_reminders()
     @update_all_sheets_attendance.before_loop
     async def before_update(self):
