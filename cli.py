@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
 import utils.db as db
+from utils.reminders import format_reminder_message, split_discord_message
 
 DEFAULT_MESSAGE = "📣 **Meeting Name: {meeting}**\n📅 {date} · {time}–{end_time}\n\nAttendees (marked Y):\n{attendees}\n\nPotential (marked M):\n{potential}\n\nNot attending (marked N):\n{not_attending}\n\nUnknown (blank in spreadsheet):\n{unknown}\n\nIf you intend to come or change your status, please open the [spreadsheet here]({spreadsheet})"
 
@@ -19,7 +20,7 @@ def parser():
     commands = p.add_subparsers(dest="command", required=True)
 
     help_parser = commands.add_parser("help", help="show CLI help")
-    help_parser.add_argument("topic", nargs="?", choices=("servers", "setup", "setup-sheets", "attendees", "edit", "events", "attendance", "link", "unlink"))
+    help_parser.add_argument("topic", nargs="?", choices=("servers", "setup", "setup-sheets", "attendees", "edit", "events", "preview", "attendance", "link", "unlink"))
     commands.add_parser("servers", help="list configured servers")
 
     setup = commands.add_parser("setup", help="configure reminders for a server")
@@ -53,6 +54,9 @@ def parser():
 
     events = commands.add_parser("events", help="list a server's events")
     events.add_argument("--server-id", required=True, type=int)
+
+    preview = commands.add_parser("preview", help="preview the next scheduled reminder")
+    preview.add_argument("--server-id", required=True, type=int)
 
     attendance = commands.add_parser("attendance", help="show attendance for an event")
     attendance.add_argument("--server-id", required=True, type=int)
@@ -170,6 +174,39 @@ async def run(args):
                        if event["end_time"] else None)
                 when = f"{start:%Y-%m-%d %H:%M %Z}–{end:%H:%M %Z}" if end else f"{start:%Y-%m-%d %H:%M %Z}–end unavailable"
                 print(f"{event['event_id']}  {when}  {event['name']}")
+        elif args.command == "preview":
+            server = await db.get_server(args.server_id)
+            if server is None:
+                raise ValueError("Server is not configured")
+            now = datetime.now(timezone.utc)
+            upcoming = [
+                (datetime.fromtimestamp(event["start_time"] - minutes * 60, timezone.utc), event, minutes)
+                for event in await db.get_events(args.server_id)
+                for minutes in server["times_before"]
+                if datetime.fromtimestamp(event["start_time"] - minutes * 60, timezone.utc) > now
+            ]
+            if not upcoming:
+                print("No upcoming reminders are scheduled.")
+            else:
+                due, event, minutes = min(upcoming, key=lambda item: item[0])
+                attendees = await db.get_attendees(args.server_id, event["event_id"])
+                sheet_config = await db.get_sheet_config(args.server_id) or {}
+                try:
+                    message = format_reminder_message(
+                        server["message"], event, attendees, server["timezone"],
+                        sheet_config.get("url", ""),
+                    )
+                except (KeyError, IndexError, ValueError) as exc:
+                    raise ValueError(f"Invalid message template: {exc}") from exc
+                chunks = split_discord_message(message)
+                local_due = due.astimezone(ZoneInfo(server["timezone"]))
+                print(f"Next reminder: {local_due:%A, %B %-d, %Y at %-I:%M %p %Z}")
+                print(f"Meeting: {event['name']}")
+                print(f"Reminder offset: {minutes} minutes")
+                print(f"Channel ID: {server['reminder_channel_id']}")
+                print(f"Discord messages: {len(chunks)}")
+                for index, chunk in enumerate(chunks, 1):
+                    print(f"\n--- Message {index}/{len(chunks)} ---\n{chunk}")
         elif args.command == "attendance":
             if not await db.get_server(args.server_id):
                 raise ValueError("Server is not configured")

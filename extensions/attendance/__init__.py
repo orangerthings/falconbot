@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo, available_timezones
 import utils.db as db
 import utils.embed as embed_helpers
 import utils.localization as l
+from utils.reminders import format_reminder_message, split_discord_message
 
 def to_military_times(time_range) -> tuple[tuple[int, int], tuple[int, int]]:
     time_range = time_range.lower().replace(" ", "")
@@ -56,16 +57,7 @@ class ExtensionCog(commands.Cog):
         delay = (dt - datetime.now(dt_timezone.utc)).total_seconds()
         if delay > 0:
             await asyncio.sleep(delay)
-        chunks = []
-        while len(message) > 2000:
-            split_at = message.rfind("\n", 0, 2000)
-            if split_at <= 0:
-                split_at = 2000
-            chunks.append(message[:split_at])
-            message = message[split_at:].lstrip("\n")
-        if message:
-            chunks.append(message)
-        for chunk in chunks:
+        for chunk in split_discord_message(message):
             try:
                 await channel.send(chunk)
             except discord.DiscordException as e:
@@ -98,37 +90,14 @@ class ExtensionCog(commands.Cog):
             for event in await db.get_events(server_id):
                 attendees = await db.get_attendees(server_id, event["event_id"])
 
-                def roster(status, ping=True):
-                    names = [
-                        f"{a['name']} ||<@{a['discord_id']}>||" if ping and a["discord_id"] else a["name"]
-                        for a in attendees if a["status"] == status
-                    ]
-                    return "\n".join(f"> {name}" for name in names) if names else "None"
-
-                pings = " ".join(
-                    f"<@{a['discord_id']}>" if a["discord_id"] else a["name"]
-                    for a in attendees if a["status"] in {"Y", "M"}
-                )
                 start_time = event["start_time"]
                 minutes = reminder_time["minutes"]
                 due = datetime.fromtimestamp(start_time - minutes * 60, tz=dt_timezone.utc)
                 key = (server_id, str(event["event_id"]), str(minutes))
                 try:
-                    local_start = datetime.fromtimestamp(start_time, tz=dt_timezone.utc).astimezone(ZoneInfo(server["timezone"]))
-                    message = server["message"].format(
-                        users=f"||{pings}||" if pings else "None",
-                        meeting=event["name"],
-                        attendees=roster("Y"),
-                        maybe=roster("M"),
-                        potential=roster("M"),
-                        not_attending=roster("N", ping=False),
-                        unknown=roster(""),
-                        date=local_start.strftime("%B %-d, %Y"),
-                        time=local_start.strftime("%-I:%M %p"),
-                        end_time=(datetime.fromtimestamp(event["end_time"], tz=dt_timezone.utc)
-                                  .astimezone(ZoneInfo(server["timezone"])).strftime("%-I:%M %p")
-                                  if event["end_time"] else "unavailable"),
-                        spreadsheet=sheet_configs[server_id].get("url", ""),
+                    message = format_reminder_message(
+                        server["message"], event, attendees, server["timezone"],
+                        sheet_configs[server_id].get("url", ""),
                     )
                 except (KeyError, IndexError, ValueError) as e:
                     print(f"Invalid reminder template for server {server_id}: {e}")
