@@ -1,4 +1,5 @@
 import asyncio
+import os
 import discord
 from discord import app_commands
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -67,7 +68,27 @@ class ExtensionCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.reminders = {}
         self.bot = bot
-        self.update_all_sheets_attendance.start()
+
+    async def cog_load(self):
+        try:
+            interval_minutes = int(os.getenv("ATTENDANCE_SYNC_INTERVAL_MINUTES", "10"))
+        except ValueError:
+            interval_minutes = 10
+        if interval_minutes != 10:
+            self.update_all_sheets_attendance.change_interval(minutes=interval_minutes)
+        if not self.update_all_sheets_attendance.is_running():
+            self.update_all_sheets_attendance.start()
+
+    def cog_unload(self):
+        self.update_all_sheets_attendance.cancel()
+        for _, task in list(self.reminders.values()):
+            task.cancel()
+        self.reminders.clear()
+
+    async def fetch_sheet_values(self, url: str, sheet: str) -> list[list[str]]:
+        return await asyncio.to_thread(
+            lambda: self.bot.gspread.open_by_url(url).worksheet(sheet).get_all_values()
+        )
 
     async def schedule_reminders(self):
         desired = {}
@@ -206,6 +227,10 @@ class ExtensionCog(commands.Cog):
             config[key] = parsed
             config.pop("server_id", None)
             await db.save_gsheet_config(server_id, **config)
+        try:
+            await self.schedule_reminders()
+        except Exception as e:
+            print(f"Failed to refresh reminders after editing {field.name}: {e}")
         await interaction.response.send_message(f"Updated {field.name}.", ephemeral=True)
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -268,7 +293,7 @@ class ExtensionCog(commands.Cog):
         print(matches)
         return [app_commands.Choice(name=tz, value=tz) for tz in matches[:25]]
 
-    async def update_sheets_attendance(self, server_id: int) -> tuple[int, int]:
+    async def update_sheets_attendance(self, server_id: int, cached_values: list[list[str]] | None = None) -> tuple[int, int]:
         server = await db.get_server(server_id)
         config = await db.get_sheet_config(server_id)
         if server is None or config is None:
@@ -300,12 +325,13 @@ class ExtensionCog(commands.Cog):
         except Exception as e:
             raise e
 
-        try:
-            values = await asyncio.to_thread(
-                lambda: self.bot.gspread.open_by_url(url).worksheet(sheet).get_all_values()
-            )
-        except Exception as e:
-            raise e
+        if cached_values is not None:
+            values = cached_values
+        else:
+            try:
+                values = await self.fetch_sheet_values(url, sheet)
+            except Exception as e:
+                raise e
 
         def cell(r: int, c: int) -> str:
             row = values[r] if 0 <= r < len(values) else []
@@ -448,6 +474,11 @@ class ExtensionCog(commands.Cog):
             )
             return
 
+        try:
+            await self.schedule_reminders()
+        except Exception as e:
+            print(f"Failed to schedule reminders after setup_sheets: {e}")
+
         await interaction.followup.send(
             l.get("attendance.setup_spreadsheet_success", events=num_events, attendances=num_attendances),
             ephemeral=True,
@@ -551,21 +582,33 @@ class ExtensionCog(commands.Cog):
         else:
             await interaction.response.send_message(l.get("attendance.link_discord_failed_message"))
     
-    @tasks.loop(seconds=10)
+    @tasks.loop(minutes=10)
     async def update_all_sheets_attendance(self):
+        sheet_cache: dict[tuple[str, str], list[list[str]]] = {}
         for server in self.bot.guilds:
             try:
                 existing = await db.get_sheet_config(server.id)
                 if existing is None:
                     continue
-                await self.update_sheets_attendance(server.id)
+                cache_key = (existing["url"], existing["sheet"])
+                if cache_key not in sheet_cache:
+                    sheet_cache[cache_key] = await self.fetch_sheet_values(existing["url"], existing["sheet"])
+                await self.update_sheets_attendance(server.id, cached_values=sheet_cache[cache_key])
             except Exception as e:
                 print(f"Attendance sync failed for server {server.id}: {e}")
                 continue
-        await self.schedule_reminders()
+        try:
+            await self.schedule_reminders()
+        except Exception as e:
+            print(f"Failed to schedule reminders: {e}")
+
     @update_all_sheets_attendance.before_loop
     async def before_update(self):
         await self.bot.wait_until_ready()
+
+    @update_all_sheets_attendance.error
+    async def on_update_all_sheets_attendance_error(self, error):
+        print(f"Unhandled error in update_all_sheets_attendance loop: {error}")
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(ExtensionCog(bot))
